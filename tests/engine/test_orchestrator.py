@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import janus
 import pytest
 import torch
+from PIL import Image
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
@@ -51,7 +52,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
-from vllm_omni.watermarking import AudioTensor, AudioWatermarkerBase
+from vllm_omni.watermarking import AudioTensor, AudioWatermarkerBase, ImageWatermarkerBase
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -3148,6 +3149,86 @@ async def test_stage_pool_watermark_cancellation_waits_before_abort() -> None:
     await aborting
     watermarker.watermark_output.assert_called_once()
     watermarker.discard_request_state.assert_called_once_with("r")
+
+
+def _image_watermark_pool(watermarker: MagicMock, *, strict: bool = True) -> StagePool:
+    client = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    pool = StagePool(0, [client], watermarkers={"image": watermarker}, strict_watermarking=strict)
+    pool._request_watermarking["r"] = True
+    return pool
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_watermarks_diffusion_images() -> None:
+    """Ensure diffusion images, carried as PIL images, are replaced by marked ones."""
+    marked = Image.new("RGB", (8, 8), color="red")
+    watermarker = MagicMock(spec=ImageWatermarkerBase)
+    watermarker.watermark_images.return_value = [marked]
+    pool = _image_watermark_pool(watermarker)
+    output = OmniRequestOutput.from_diffusion(request_id="r", images=[Image.new("RGB", (8, 8))])
+
+    result = await pool.process_diffusion_output(output)
+
+    assert result is output
+    assert result.images == [marked]
+    watermarker.watermark_images.assert_called_once()
+    watermarker.discard_request_state.assert_called_once_with("r")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("watermarking", [None, True, False])
+async def test_request_image_watermarking(watermarking: bool | None) -> None:
+    """Ensure diffusion image requests honour the per-request watermarking opt-out."""
+    image = Image.new("RGB", (8, 8))
+    marked = Image.new("RGB", (8, 8), color="red")
+    watermarker = MagicMock(spec=ImageWatermarkerBase)
+    watermarker.watermark_images.return_value = [marked]
+    client = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    pool = StagePool(0, [client], watermarkers={"image": watermarker})
+    params = OmniDiffusionSamplingParams(watermarking=watermarking)
+    await pool.submit_initial("r", SimpleNamespace(sampling_params_list=[params]), SimpleNamespace(request_id="r"))
+
+    result = await pool.process_diffusion_output(OmniRequestOutput.from_diffusion(request_id="r", images=[image]))
+
+    if watermarking is False:
+        watermarker.watermark_images.assert_not_called()
+        assert result.images == [image]
+    else:
+        watermarker.watermark_images.assert_called_once()
+        assert result.images == [marked]
+
+
+@pytest.mark.asyncio
+async def test_strict_image_watermark_failure_replaces_output_with_error() -> None:
+    """Ensure a strict image watermarking failure yields an error output, never unmarked images."""
+    watermarker = MagicMock(spec=ImageWatermarkerBase)
+    watermarker.watermark_images.side_effect = RuntimeError("model failed")
+    pool = _image_watermark_pool(watermarker)
+    output = OmniRequestOutput.from_diffusion(request_id="r", images=[Image.new("RGB", (8, 8))])
+
+    result = await pool.process_diffusion_output(output)
+
+    assert result is not output
+    assert result.finished
+    assert result.images == []
+    assert result.error == "Failed to watermark output"
+    watermarker.discard_request_state.assert_called_with("r")
+
+
+@pytest.mark.asyncio
+async def test_non_strict_image_watermark_failure_keeps_output() -> None:
+    """Ensure a non-strict image watermarking failure delivers the output as generated."""
+    image = Image.new("RGB", (8, 8))
+    watermarker = MagicMock(spec=ImageWatermarkerBase)
+    watermarker.watermark_images.side_effect = RuntimeError("model failed")
+    pool = _image_watermark_pool(watermarker, strict=False)
+    output = OmniRequestOutput.from_diffusion(request_id="r", images=[image])
+
+    result = await pool.process_diffusion_output(output)
+
+    assert result is output
+    assert result.images == [image]
+    assert result.error is None
 
 
 @pytest.mark.asyncio

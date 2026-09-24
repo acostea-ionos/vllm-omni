@@ -14,7 +14,7 @@ from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 from vllm_omni.outputs.output_modality import OutputModalityNames
-from vllm_omni.watermarking.base import Watermarker, WatermarkFailureError
+from vllm_omni.watermarking.base import ImageWatermarkerBase, Watermarker, WatermarkFailureError
 from vllm_omni.watermarking.converters import (
     MEDIA_CONVERTERS,
     media_to_tensor,
@@ -90,6 +90,16 @@ def _watermark_core_output(
         output.multimodal_output = payload  # type: ignore[assignment]
 
 
+def _watermark_images(output: OmniRequestOutput, watermarker: Watermarker) -> None:
+    """Watermark diffusion images, which travel as PIL images in ``images`` rather than in a payload."""
+    if not isinstance(watermarker, ImageWatermarkerBase):
+        raise WatermarkFailureError(f"{type(watermarker).__name__} cannot watermark PIL images")
+    try:
+        output.images = watermarker.watermark_images(output.request_id, output.images)
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise WatermarkFailureError("invalid image output") from error
+
+
 def _watermark_request_output(
     output: RequestOutput,
     watermarkers: Mapping[str, Watermarker],
@@ -112,6 +122,10 @@ def _watermark_request_output(
                 watermarker,
                 payload,
             )
+
+    image_watermarker = watermarkers.get(OutputModalityNames.IMAGE.value)
+    if isinstance(output, OmniRequestOutput) and output.images and image_watermarker is not None:
+        _watermark_images(output, image_watermarker)
 
     if output.finished:
         for watermarker in watermarkers.values():

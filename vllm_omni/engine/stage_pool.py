@@ -121,8 +121,11 @@ class StagePool:
         for modality, watermarker_types in cls._watermarker_registry.items():
             config = watermark_config.modalities.get(modality)
             if config is not None and modality == final_output_type:
-                # Algorithm already validated by WatermarkConfig, no need to do it again here
-                watermarkers[modality] = watermarker_types[cast(str, config[ALGORITHM_KEY])]()
+                # Algorithm already validated by WatermarkConfig, no need to do it again here.
+                # Remaining keys configure the implementation, e.g. a checkpoint path;
+                # unknown keys fail here at startup rather than on the first request.
+                options = {key: value for key, value in config.items() if key != ALGORITHM_KEY}
+                watermarkers[modality] = watermarker_types[cast(str, config[ALGORITHM_KEY])](**options)
                 logger.info("Initialized watermarker for modality %s", modality)
         return watermarkers
 

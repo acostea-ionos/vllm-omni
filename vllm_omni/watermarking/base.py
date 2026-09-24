@@ -2,15 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from threading import Lock
 from typing import ClassVar, Generic, TypeVar
 
+import numpy as np
 import torch
+from PIL import Image
 from vllm.logger import init_logger
 
-from vllm_omni.watermarking.types import AudioTensor
+from vllm_omni.watermarking.types import AudioTensor, ImageTensor
 
 logger = init_logger(__name__)
 
@@ -268,3 +270,81 @@ class AudioWatermarkerBase(Watermarker[AudioTensor, _AudioRequestState[AudioImpl
 
     def _close_audio_state(self, state: AudioImplStateT) -> None:
         """Release implementation resources for one audio request."""
+
+
+class ImageWatermarkerBase(Watermarker[ImageTensor, None]):
+    """Provide common image validation and PIL conversion.
+
+    Images are produced whole rather than streamed, so implementations keep no
+    per-request state.
+    """
+
+    supported_types = (ImageTensor,)
+
+    def watermark_images(self, request_id: str, images: Sequence[Image.Image]) -> list[Image.Image]:
+        """Watermark generated PIL images, preserving their size.
+
+        Images come back as RGB, or RGBA when the input had an alpha band; the
+        alpha band is carried over untouched.
+        """
+        return [self._watermark_pil(request_id, image) for image in images]
+
+    def is_image_watermarked(self, image: Image.Image) -> bool:
+        """Return whether a PIL image contains this implementation's watermark."""
+        return self.is_watermarked(self._pil_to_tensor(image))
+
+    def _watermark_pil(self, request_id: str, image: Image.Image) -> Image.Image:
+        """Watermark one PIL image through the tensor path."""
+        if not isinstance(image, Image.Image):
+            raise TypeError(f"image output must be a PIL image, got {type(image).__name__}")
+        pixels = self.watermark(request_id, self._pil_to_tensor(image)).pixels[0]
+        array = pixels.clamp(0, 1).mul(255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+        result = Image.fromarray(array)
+        if "A" in image.getbands():
+            result.putalpha(image.getchannel("A"))
+        return result
+
+    @staticmethod
+    def _pil_to_tensor(image: Image.Image) -> ImageTensor:
+        """Convert a PIL image to a single-item float RGB batch."""
+        array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        return ImageTensor(torch.from_numpy(array.copy()).permute(2, 0, 1)[None].float().div_(255))
+
+    def _new_state(self, data: ImageTensor) -> None:
+        """Images need no state between calls."""
+        return None
+
+    def _watermark(self, data: ImageTensor, state: None) -> ImageTensor:
+        """Validate and watermark a batch of images."""
+        self._validate_image(data)
+        return self._watermark_image(data)
+
+    def _is_watermarked(self, data: ImageTensor) -> bool:
+        """Validate and check a batch of images for a watermark."""
+        self._validate_image(data)
+        return self._is_image_watermarked(data)
+
+    @staticmethod
+    def _validate_image(data: ImageTensor) -> None:
+        """Validate image layout and dtype."""
+        pixels = data.pixels
+        if pixels.ndim != 4 or pixels.shape[1] != 3:
+            raise ValueError(f"image pixels must have shape [batch, 3, height, width], got {tuple(pixels.shape)}")
+        if not pixels.is_floating_point():
+            raise TypeError("image pixels must use a floating-point dtype")
+
+    def _validate_output(self, source: ImageTensor, watermarked: ImageTensor) -> None:
+        """Ensure watermarking preserved the image shape and produced finite pixels."""
+        super()._validate_output(source, watermarked)
+        if watermarked.pixels.shape != source.pixels.shape:
+            raise ValueError("image watermarker changed the image shape")
+        if not torch.isfinite(watermarked.pixels).all():
+            raise ValueError("image watermarker produced non-finite pixels")
+
+    @abstractmethod
+    def _watermark_image(self, data: ImageTensor) -> ImageTensor:
+        """Watermark a validated batch of images."""
+
+    @abstractmethod
+    def _is_image_watermarked(self, data: ImageTensor) -> bool:
+        """Check a validated batch of images for this implementation's watermark."""

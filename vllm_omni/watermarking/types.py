@@ -12,3 +12,10 @@ class AudioTensor:
 
     samples: torch.Tensor
     sample_rate: int
+
+
+@dataclass(frozen=True)
+class ImageTensor:
+    """Float RGB images in [0, 1] with shape [batch, 3, height, width]."""
+
+    pixels: torch.Tensor

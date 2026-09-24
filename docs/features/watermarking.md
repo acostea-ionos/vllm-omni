@@ -1,6 +1,6 @@
 # Watermarking
 
-vLLM-Omni supports text watermarking at sampling time in the same way as vLLM, in addition to watermarking generated multimodal outputs as post-processing. Currently, only audio watermarking is supported, with image & video watermarking being an active area of integration.
+vLLM-Omni supports text watermarking at sampling time in the same way as vLLM, in addition to watermarking generated multimodal outputs as post-processing. Currently, audio and image watermarking are supported, with video watermarking being an active area of integration.
 
 For more details on text watermarking, read vLLM's [text watermarking docs](https://docs.vllm.ai/en/latest/features/watermarking/).
 
@@ -43,6 +43,26 @@ omni = Omni(
     watermark_config=WatermarkConfig({"audio": {"algorithm": "audioseal"}}),
 )
 ```
+
+### Image Watermarking with VideoSeal
+
+Images are watermarked through Meta's [VideoSeal](https://github.com/facebookresearch/videoseal), which embeds a fixed bit message in every generated image after generation, before encoding. It loads a Meta Seal TorchScript model, such as the 256-bit image model [`y_256b_img.jit`](https://dl.fbaipublicfiles.com/videoseal/y_256b_img.jit), so it needs no packages beyond PyTorch. Download the model ahead of time and pass its path; nothing is downloaded at startup.
+
+```bash
+vllm serve black-forest-labs/FLUX.2-klein-4B --omni \
+  --watermark-config '{"strict": true, "modalities": {"image": {"algorithm": "videoseal", "checkpoint": "/models/y_256b_img.jit", "message": "<64 hex digits>"}}}'
+```
+
+The image watermarker accepts these options:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `checkpoint` | required | Path to the TorchScript model. |
+| `message` | a fixed vLLM-Omni message | Message to embed, as hex digits (64 for a 256-bit model). Set your own so detection identifies your deployment. |
+| `device` | `cpu` | Device to run the watermark model on, e.g. `cuda`. |
+| `num_threads` | PyTorch default | Caps PyTorch's CPU threads. On many-core hosts the default can make CPU watermarking several times slower. |
+
+At startup the watermarker marks and decodes a probe image, and refuses to start if it cannot recover its message.
 
 ## Opting out per request
 
@@ -90,6 +110,17 @@ samples = torch.from_numpy(audio.T)
 print(AudioSealWatermarker().is_watermarked(AudioTensor(samples, sample_rate)))
 ```
 
+For images, `is_image_watermarked()` takes a PIL image and checks it for the configured message, so construct the watermarker with the same `checkpoint` and `message` as the deployment:
+
+```python
+from PIL import Image
+
+from vllm_omni.watermarking import VideoSealWatermarker
+
+watermarker = VideoSealWatermarker(checkpoint="/models/y_256b_img.jit", message="<64 hex digits>")
+print(watermarker.is_image_watermarked(Image.open("generated.png")))
+```
+
 Please note that detection support is largely offered as a convenience for local verification, and is usually not ideal for optimal client-side detection.
 
 ## Limitations
@@ -99,3 +130,7 @@ Please note that detection support is largely offered as a convenience for local
 - AudioSeal requires mono audio inputs; for models emitting stereo outputs, e.g., Stable Audio, we downmix to mono and watermark the mid signal.
 
 - Audio watermarking currently depends on the sampling rate being emitted consistently per model, which may cause it to fail for some models. This is being actively worked on as a fix.
+
+- The image generation endpoints do not accept the `watermarking` request field yet, so online image requests cannot opt out; offline requests can, through the sampling params.
+
+- Image watermarks are embedded before encoding, so lossy formats, resizing and cropping can weaken or remove them. Check robustness for your use case with the detector.
