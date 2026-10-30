@@ -29,6 +29,7 @@ class _SealModel(Protocol):
 class VideoSealWatermarker(ImageWatermarkerBase):
     """Watermark images with a Meta Seal TorchScript model such as VideoSeal v1.0.
 
+
     Configured through ``--watermark-config``, e.g.::
 
         {"strict": true,
@@ -138,3 +139,13 @@ class VideoSealWatermarker(ImageWatermarkerBase):
         """Return the lowest per-image fraction of message bits recovered."""
         bits = (preds[:, 1:] > 0).to(message.dtype)
         return (bits == message).float().mean(dim=1).min().item()
+
+
+class PixelSealWatermarker(VideoSealWatermarker):
+    """Watermark images with a TorchScript export of Meta's Pixel Seal.
+
+    Meta publishes Pixel Seal only as a PyTorch checkpoint; the export (see
+    ``docs/features/watermarking.md``) has the same interface as VideoSeal's.
+    """
+
+    ALGORITHM: ClassVar[str] = "pixelseal"

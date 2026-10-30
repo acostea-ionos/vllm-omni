@@ -10,7 +10,7 @@ import torch
 from PIL import Image
 
 from vllm_omni.config.watermarking import WatermarkConfig
-from vllm_omni.watermarking import WATERMARKER_REGISTRY, ImageTensor, VideoSealWatermarker
+from vllm_omni.watermarking import WATERMARKER_REGISTRY, ImageTensor, PixelSealWatermarker, VideoSealWatermarker
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -67,10 +67,12 @@ def _noise_image(mode: str = "RGB", size: tuple[int, int] = (320, 256)) -> Image
     return Image.fromarray(torch.randint(0, 256, shape, generator=generator, dtype=torch.uint8).numpy())
 
 
-def test_image_watermarker_is_registered(tmp_path: Path) -> None:
-    """Ensure the videoseal algorithm is selectable through the watermark config."""
-    assert WATERMARKER_REGISTRY["image"]["videoseal"] is VideoSealWatermarker
-    WatermarkConfig({"image": {"algorithm": "videoseal", "checkpoint": _save_fake(tmp_path)}})
+@pytest.mark.parametrize("algorithm, cls", [("videoseal", VideoSealWatermarker), ("pixelseal", PixelSealWatermarker)])
+def test_image_watermarker_is_registered(tmp_path: Path, algorithm: str, cls: type[VideoSealWatermarker]) -> None:
+    """Ensure each Meta Seal algorithm is selectable through the watermark config."""
+    assert WATERMARKER_REGISTRY["image"][algorithm] is cls
+    assert cls.ALGORITHM == algorithm
+    WatermarkConfig({"image": {"algorithm": algorithm, "checkpoint": _save_fake(tmp_path)}})
 
 
 def test_watermark_images_round_trips_pil(watermarker: VideoSealWatermarker) -> None:
@@ -145,12 +147,13 @@ def test_invalid_message_fails_at_startup(tmp_path: Path, message: str, error: s
         VideoSealWatermarker(checkpoint=_save_fake(tmp_path), message=message)
 
 
-def test_missing_checkpoint_fails_at_startup(tmp_path: Path) -> None:
-    """Ensure a missing checkpoint is reported with a pointer to the model."""
-    with pytest.raises(ValueError, match="checkpoint"):
-        VideoSealWatermarker()
-    with pytest.raises(FileNotFoundError):
-        VideoSealWatermarker(checkpoint=str(tmp_path / "missing.jit"))
+@pytest.mark.parametrize("cls", [VideoSealWatermarker, PixelSealWatermarker])
+def test_missing_checkpoint_fails_at_startup(tmp_path: Path, cls: type[VideoSealWatermarker]) -> None:
+    """Ensure a missing checkpoint is reported with a pointer to the model, naming the algorithm."""
+    with pytest.raises(ValueError, match=f"{cls.ALGORITHM} watermarking requires a 'checkpoint'"):
+        cls()
+    with pytest.raises(FileNotFoundError, match=f"{cls.ALGORITHM} checkpoint not found"):
+        cls(checkpoint=str(tmp_path / "missing.jit"))
 
 
 def test_self_check_rejects_model_that_does_not_round_trip(tmp_path: Path) -> None:
@@ -161,7 +164,7 @@ def test_self_check_rejects_model_that_does_not_round_trip(tmp_path: Path) -> No
 
 @pytest.mark.skipif(
     not os.environ.get("VIDEOSEAL_CHECKPOINT"),
-    reason="set VIDEOSEAL_CHECKPOINT to a Meta Seal TorchScript model (e.g. y_256b_img.jit)",
+    reason="set VIDEOSEAL_CHECKPOINT to a Meta Seal TorchScript model (y_256b_img.jit or a Pixel Seal export)",
 )
 def test_real_checkpoint_marks_flux_sized_images() -> None:
     """Ensure a real Meta Seal model marks and detects a FLUX-sized image after PNG encoding."""

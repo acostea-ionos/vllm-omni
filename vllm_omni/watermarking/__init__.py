@@ -9,11 +9,11 @@ from vllm_omni.watermarking.base import (
     WatermarkFailureError,
 )
 from vllm_omni.watermarking.types import AudioTensor, ImageTensor
-from vllm_omni.watermarking.video_seal import VideoSealWatermarker
+from vllm_omni.watermarking.video_seal import PixelSealWatermarker, VideoSealWatermarker
 
 WATERMARKER_REGISTRY: dict[str, dict[str, type[Watermarker]]] = {
     "audio": {"audioseal": AudioSealWatermarker},
-    "image": {"videoseal": VideoSealWatermarker},
+    "image": {"videoseal": VideoSealWatermarker, "pixelseal": PixelSealWatermarker},
 }
 
 __all__ = [
@@ -22,6 +22,7 @@ __all__ = [
     "AudioWatermarkerBase",
     "ImageTensor",
     "ImageWatermarkerBase",
+    "PixelSealWatermarker",
     "VideoSealWatermarker",
     "WATERMARKER_REGISTRY",
     "WatermarkFailureError",

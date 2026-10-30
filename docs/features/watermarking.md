@@ -64,6 +64,104 @@ The image watermarker accepts these options:
 
 At startup the watermarker marks and decodes a probe image, and refuses to start if it cannot recover its message.
 
+#### Pixel Seal
+
+[Pixel Seal](https://github.com/facebookresearch/videoseal) is Meta's newer 256-bit image watermarking model. It is selected with `"algorithm": "pixelseal"` and takes the same options, but Meta publishes it only as a PyTorch checkpoint, so it must first be exported to a TorchScript file with the same `embed`/`detect` interface as `y_256b_img.jit`:
+
+```bash
+vllm serve black-forest-labs/FLUX.2-klein-4B --omni \
+  --watermark-config '{"strict": true, "modalities": {"image": {"algorithm": "pixelseal", "checkpoint": "/models/pixelseal_y_256b_img.jit", "message": "<64 hex digits>", "device": "cuda"}}}'
+```
+
+The export runs once, offline, and needs Meta's `videoseal` package installed from its GitHub repository (the PyPI release does not include the Pixel Seal model card; this recipe was tested at commit `870ca7f`) and the [`checkpoint.pth`](https://dl.fbaipublicfiles.com/videoseal/pixelseal/checkpoint.pth). Serving needs neither. Pixel Seal does not compile with `torch.jit.script`, so it is traced; tracing records devices, so two patches applied during the trace keep the file loadable on both CPU and CUDA:
+
+```python
+import contextlib
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+import torch
+import videoseal
+from videoseal.modules.msg_processor import MsgProcessor
+from videoseal.utils.cfg import setup_model_from_model_card
+
+checkpoint, out = Path(sys.argv[1]), sys.argv[2]
+
+# Build the model from Pixel Seal's model card, which sets the released watermark strength.
+card = (Path(videoseal.__file__).parent / "cards" / "pixelseal.yaml").read_text()
+card = re.sub(r"(?m)^checkpoint_path:.*$", f"checkpoint_path: {checkpoint.resolve()}", card)
+with tempfile.TemporaryDirectory() as tmp:
+    (Path(tmp) / "pixelseal.yaml").write_text(card)
+    model = setup_model_from_model_card(Path(tmp) / "pixelseal.yaml").eval().requires_grad_(False)
+
+
+class MetaSealInterface(torch.nn.Module):
+    """The TorchScript interface: embed(imgs, msgs) -> imgs, detect(imgs) -> [B, 1 + nbits]."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def embed(self, imgs, msgs):
+        return self.model.embed(imgs, msgs, is_video=False)["imgs_w"]
+
+    def detect(self, imgs):
+        preds = self.model.detect(imgs, is_video=False)["preds"]
+        return preds.mean(dim=(2, 3)) if preds.ndim > 2 else preds
+
+
+def binary_msg_forward(self, latents, msg, verbose=False):
+    # MsgProcessor.forward for binary messages, with the indices built from msg:
+    # torch.arange would record the trace device.
+    indices = (2 * (torch.ones_like(msg).cumsum(-1) - 1) + msg).long()
+    msg_aux = self.msg_embeddings(indices).sum(dim=-2)
+    msg_aux = msg_aux[..., None, None].repeat(1, 1, latents.shape[-2], latents.shape[-1])
+    if self.msg_agg == "concat":
+        return torch.cat([latents, self.msg_mult * msg_aux], dim=1)
+    return latents + self.msg_mult * msg_aux
+
+
+def device_of(args, kwargs):
+    if kwargs.keys() - {"device", "non_blocking"} or len(args) > 1:
+        return None
+    target = kwargs.get("device", args[0] if args else None)
+    return torch.device(target) if isinstance(target, (str, torch.device)) else None
+
+
+@contextlib.contextmanager
+def device_independent_trace():
+    # Same-device .to() calls are no-ops when served, so keep them out of the trace.
+    tensor_to, module_to, msg_forward = torch.Tensor.to, torch.nn.Module.to, MsgProcessor.forward
+
+    def tensor_to_patched(self, *args, **kwargs):
+        target = device_of(args, kwargs)
+        return self if target is not None and target.type == self.device.type else tensor_to(self, *args, **kwargs)
+
+    def module_to_patched(self, *args, **kwargs):
+        target, current = device_of(args, kwargs), next(self.parameters(), next(self.buffers(), None))
+        if target is not None and (current is None or target.type == current.device.type):
+            return self
+        return module_to(self, *args, **kwargs)
+
+    torch.Tensor.to, torch.nn.Module.to, MsgProcessor.forward = tensor_to_patched, module_to_patched, binary_msg_forward
+    try:
+        yield
+    finally:
+        torch.Tensor.to, torch.nn.Module.to, MsgProcessor.forward = tensor_to, module_to, msg_forward
+
+
+imgs, msgs = torch.rand(1, 3, 512, 512), torch.randint(0, 2, (1, 256)).float()
+with device_independent_trace(), torch.inference_mode():
+    traced = torch.jit.trace_module(
+        MetaSealInterface(model), {"embed": (imgs, msgs), "detect": (imgs,)}, check_trace=False
+    )
+torch.jit.save(traced, out)
+```
+
+Save it as e.g. `export_pixelseal.py` and run `python export_pixelseal.py checkpoint.pth pixelseal_y_256b_img.jit`. The watermarker's startup self-check verifies that the exported file round-trips its message. In our tests, the export's outputs were identical to the eager model on CPU and within one 8-bit level on CUDA, with every message bit recovered. Serving FLUX.2-klein-4B at 1024x1024 on an L40S, it added about 34 ms per request on CUDA and about 340 ms on CPU, so prefer `"device": "cuda"` for Pixel Seal.
+
 ## Opting out per request
 
 Requests can opt out by setting `watermarking` to `false`, e.g., in the respective request
